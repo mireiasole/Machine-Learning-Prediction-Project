@@ -1,0 +1,143 @@
+---
+title: "Machine Learning Project"
+author: "Mireia"
+date: "2024-01-18"
+output: html_document
+---
+
+
+## Loading the data
+
+First, we must download the necessary libraries, set the seed, and load our training and testing data.
+
+```{r, results='hide', warning=FALSE, message=FALSE}
+set.seed(575)
+library(caret); library(dplyr); library(randomForest); library(rattle)
+
+testing <- read.csv("pml-testing.csv")
+training <- read.csv("pml-training.csv")
+
+training$classe <- as.factor(training$classe) #Convert classe into a factor variable
+```
+
+## Managing and reducing our dataset
+
+Since our model has over 150 variables and we have no previous knowledge that could help us determine which of them are the most influential, we must eliminate variables that have few data or almost no variance.
+
+```{r}
+nzv <- which(nearZeroVar(training,saveMetrics=TRUE)$nzv) #Obtain near zero variance predictors
+
+training_f <- training %>% select(-all_of(nzv)) %>% select_if(~ !any(is.na(.))) %>% select(-c(1:7)) #Remove columns with missing data, subject information variables and near zero variance variables
+
+```
+
+Now, by removing near zero variance predictors, subject info variables, and variables with missing values, we have reduced our training dataset to 51 possible predictors instead of the original 159.
+
+## Validation set
+
+We will next divide our training data into a training set and a validation set that we will then use to improve our model before testing it.
+
+```{r}
+set.seed(575)
+inBuild <- createDataPartition(y = training$classe, p=0.7, list=FALSE) #Partition training data - 70% training, 30% validation
+train_set <- training_f[inBuild,]
+val_set <- training_f[-inBuild,]
+x_test <- val_set[,-52] #Obtain every variable except class from the validation set
+y_test <- val_set$classe #Obtain the class variable from the validation set
+```
+
+## Decision tree
+
+First, we will create a simple model, a decision tree. This will most likely not be the most ideal model, but might be useful as a first step. We will use 5-fold repeated cross-validation; then, we will predict on the validation set and obtain the expected accuracy and out of sample error.
+
+```{r}
+set.seed(575)
+mod_tree <- train(classe ~. , method="rpart", data=train_set, trControl =  trainControl(method="repeatedcv", number=5))
+pred_t <- predict(mod_tree, val_set)
+tree_acc <- confusionMatrix(pred_t,val_set$classe)$overall[1]
+tree_acc
+fancyRpartPlot(mod_tree$finalModel)
+```
+
+This model has an extremely low accuracy of 48% on the validation set. It seems that it would be better to try out other models rather than tuning or modifying it.
+
+## Gradient Boosting Machine
+
+We will next try out a gradient boosting machine learning algorithm, since boosting tends to give very accurate results, trains fast on large datasets and can handle complex data. We use 5-fold repeated cross validation as before.
+
+```{r}
+set.seed(575)
+model_gbm  <- train(classe~., data=train_set, method="gbm", trControl =  trainControl(method="repeatedcv", number=5), verbose=FALSE)
+pred_gbm <- predict(model_gbm, val_set)
+gbm_acc <- confusionMatrix(pred_gbm,val_set$classe)$overall[1]
+gbm_acc
+```
+
+This model has a much higher accuracy of 95%, which means it will likely perform better on the test set.
+
+## Random Forest
+
+Finally we will fit a random forest model since they tend to be very accurate, reduce overfitting, and work for classification problems such as this one. The cross-validation will be done with x_test (the variable values in the validation set) and y_test (the classification value in the validation set). We will show the accuracy on the validation set and print the parameters that have been chosen by the model (mtry and ntree).
+
+```{r}
+set.seed(575)
+model_rf1 <- randomForest(classe~.,data=train_set, xtest=x_test, ytest=y_test, keep.forest=TRUE)
+pred1 <- predict(model_rf1, val_set)
+rf_acc <- confusionMatrix(pred1,val_set$classe)$overall[1]
+rf_acc
+model_rf1$ntree; model_rf1$mtry
+model_rf1
+```
+
+It seems this random forest already has a very high accuracy of 99%. Let's check if we can improve it and try to estimate the out of sample error. We can investigate if the number of trees (500) and the number of variables to try from for each tree and at each split (7) are adequate. First, we will perform a tuning of the mtry variable.
+
+```{r}
+
+set.seed(575)
+m2 <- tuneRF(train_set[,-52],train_set$classe, ntreeTry = 500, mtryStart=10, stepFactor = 1.2, improve = 0.01, plot= T) 
+
+```
+
+We will choose the value of mtry to be 8 based on this tuning; this value results in the lowest Out Of Bag error, moreso than lower or smaller values. The original value for mtry on our model was 7, but 8 has a slightly lower error. We can see how our error goes up when mtry increases after the optimal value.
+
+We can also look for the ideal value of ntree by plotting the Out of Bag estimate of error according to the number of trees in our random forest.
+
+```{r}
+
+plot(model_rf1$err.rate[,1], type = "l", lwd = 3, col = "blue", main = "Bagging: OOB estimate of error rate",xlab = "Number of Trees", ylab = "OOB error rate")
+
+```
+
+Although the error goes down drastically after 50 trees, 500 trees seems to be the optimal number of trees to obtain the minimal error. This was the original value for the first model. We will increase this value slightly to see if it helps accuracy and we will adjust the model from before.
+
+```{r}
+set.seed(575)
+model2 <- randomForest(classe~.,data=train_set, xtest=x_test, ytest=y_test, mtry=8, ntree=600, keep.forest=TRUE)
+model2
+pred2 <- predict(model2, val_set)
+confusionMatrix(pred2,val_set$classe)$overall[1]
+
+```
+
+The accuracy doesn't seem to differ much from the previous model. The out of sample error (test set error rate) even seems to increase slightly. We will keep the first random forest model, since changing mtry to 8 and ntree to 600 doesn't increase prediction accuracy.
+
+Let's do a final comparison of the accuracies and out of sample errors of the models.
+
+```{r}
+data <-  matrix(c(tree_acc, 1-tree_acc, gbm_acc, 1-gbm_acc, rf_acc, 1-rf_acc), ncol=2, byrow=TRUE)
+ 
+# specify the column names and row names of matrix
+colnames(data) = c('Accuracy', "Out of Sample Error")
+rownames(data) <- c("Decision Tree", "Gradient Boosting Machine", "Random Forest")
+
+data <- as.table(data)
+data
+```
+
+The best model is the random forest. We will use this one on the test set.
+
+## Test sest predictions
+
+```{r}
+predict(model_rf1, testing)
+```
